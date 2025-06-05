@@ -1469,57 +1469,71 @@ class Simulation:
 
     def handle_arrival(self) -> None:
         """
-        Обработка достижения точки маршрута (конечной точки, стартовой точки или станции).
-        После каждой точки маршрута:
-          - Если это станция — инициирует посадку/зарядку.
-          - Если это конечная точка или старт — просто переходит к следующей точке маршрута по индексу.
-          - Если маршрут окончен — завершает миссию.
+        Обработка достижения точки маршрута. На каждой док-станции можно зарядиться только один раз в каждом плече (туда/обратно) маршрута.
+        Всего не более 4 зарядок за миссию. После зарядки и подъема дрон продолжает маршрут.
         """
 
-        # Если дрон уже заряжается — никаких новых событий
         if self.is_charging:
             return
 
-        # Фиксирую позицию дрона на целевой точке (во избежание накопления ошибок)
         self.drone_pos = self.target_pos.copy()
 
-        # Проверяю — текущая цель есть в маршруте?
         if not hasattr(self, "route_points") or self.route_points is None or self.current_route_index is None:
             self.update_log("Ошибка: маршрут не задан или индекс не инициализирован.")
             self.complete_simulation()
             return
 
-        # --- Пропуск подряд идущих одинаковых точек маршрута по координате и высоте ---
-        while self.current_route_index + 1 < len(self.route_points):
-            next_point = self.route_points[self.current_route_index + 1]
-            # Определяю высоту следующей точки (станция или рабочая высота)
-            next_height = float(self.entries['drone_height'].get())
+        # --- Пропуск всех совпадающих по координате и высоте точек маршрута ---
+        while self.current_route_index < len(self.route_points):
+            cur_point = self.route_points[self.current_route_index]
+            cur_height = float(self.entries['drone_height'].get())
             for i, st in enumerate(self.stations):
-                if np.allclose(next_point, st, atol=1e-2):
-                    next_height = self.station_heights[i]
+                if np.allclose(cur_point, st, atol=1e-2):
+                    cur_height = self.station_heights[i]
                     break
-            # Пропустить только если совпадает и координата, и высота!
-            if np.allclose(self.drone_pos, next_point, atol=1e-2) and abs(self.drone_height - next_height) < 1e-2:
+            # Если мы уже на этой точке и высота совпадает — двигаем индекс вперёд
+            if np.allclose(self.drone_pos, cur_point, atol=1e-2) and abs(self.drone_height - cur_height) < 1e-2:
                 self.current_route_index += 1
+                if self.current_route_index >= len(self.route_points):
+                    break
                 continue
             else:
                 break
 
-        # --- КОРРЕКТНО: Если только что был подъём после зарядки, не выполнять повторную посадку на станции ---
+        if self.current_route_index >= len(self.route_points):
+            self.update_log("Дрон достиг финальной точки маршрута. Миссия завершена.")
+            self.complete_simulation()
+            return
+
         if getattr(self, "just_charged_and_climbed", False):
             self.update_log("Пропущена посадка после зарядки и подъема: дрон только что взлетел со станции.")
             self.just_charged_and_climbed = False
-            # Не инкрементирую индекс! Движение уже будет к текущей цели.
-            return
 
-        # Проверка: дрон на станции (по X/Y)?
+        # --- Инициализация направлений и лимитов ---
+        if not hasattr(self, "current_leg"):
+            self.current_leg = "forward"
+        if not hasattr(self, "charged_stations_forward"):
+            self.charged_stations_forward = set()
+        if not hasattr(self, "charged_stations_backward"):
+            self.charged_stations_backward = set()
+        if not hasattr(self, "total_charges"):
+            self.total_charges = 0
+
+        # --- Смена направления при достижении конца или начала маршрута ---
+        if np.allclose(self.drone_pos, self.route_points[-1], atol=1e-2):
+            self.current_leg = "backward"
+        elif np.allclose(self.drone_pos, self.route_points[0], atol=1e-2):
+            self.current_leg = "forward"
+
         STATION_RADIUS = 0.5
         for i, station in enumerate(self.stations):
             if np.linalg.norm(self.drone_pos - np.array(station)) < STATION_RADIUS:
-                # Зафиксировать положение дрона на станции (точно)
                 self.drone_pos = np.array(station)
                 self.motion_controller.set_position(np.array(station) * self.cell_size)
                 self.motion_controller.set_velocity([0, 0])
+
+                charged_set = self.charged_stations_forward if self.current_leg == "forward" else self.charged_stations_backward
+
                 # Если НЕ на высоте станции — посадка
                 if abs(self.drone_height - self.station_heights[i]) > 1e-2:
                     self.is_landing = True
@@ -1534,15 +1548,100 @@ class Simulation:
                     )
                     return
                 else:
-                    # Уже на высоте станции — сразу зарядка
+                    # Если уже заряжались на этой станции в текущем плече — не заряжаемся!
+                    if i in charged_set:
+                        self.update_log(
+                            f"Дрон уже заряжался на станции {i + 1} по направлению {self.current_leg}. Пропуск зарядки."
+                        )
+                        self.current_route_index += 1
+                        self.handle_arrival()
+                        return
+                    if self.total_charges >= 4:
+                        self.update_log(
+                            f"Достигнут лимит зарядок ({self.total_charges}/4). Дрон не будет заряжаться на станции {i + 1}."
+                        )
+                        self.current_route_index += 1
+                        self.handle_arrival()
+                        return
+                    charged_set.add(i)
+                    self.last_charged_station_idx = i
+                    self.total_charges += 1
                     self.charge_at_station(i)
                     return
 
-        # --- Дальше: переход к следующей точке маршрута (строго по route_points) ---
-        if self.current_route_index + 1 < len(self.route_points):
-            self.current_route_index += 1
-            self.target_pos = self.route_points[self.current_route_index].copy()
-            self.update_log(f"Переход к следующей точке маршрута: {self.target_pos}")
+        # --- Переход к следующей точке маршрута ---
+        if self.current_route_index < len(self.route_points):
+            next_point = self.route_points[self.current_route_index].copy()
+            self.update_log(f"Переход к следующей точке маршрута: {next_point}")
+
+            # --- Если это док-станция, используем нейросеть ---
+            station_idx = None
+            for i, st in enumerate(self.stations):
+                if np.allclose(next_point, st, atol=1e-2):
+                    station_idx = i
+                    break
+
+            if not hasattr(self, "visited_stations_this_leg"):
+                self.visited_stations_this_leg = set()
+            for i, st in enumerate(self.stations):
+                if np.allclose(self.drone_pos, st, atol=1e-2):
+                    self.visited_stations_this_leg.add(i)
+
+            if station_idx is not None and hasattr(self, 'select_station_by_nn_or_route'):
+                last_station = getattr(self, "last_charged_station_idx", None)
+                charged_set = self.charged_stations_forward if self.current_leg == "forward" else self.charged_stations_backward
+                candidate_indices = [
+                    i for i in range(len(self.stations))
+                    if not self.station_statuses[i]
+                       and i != last_station
+                       and i not in charged_set
+                ]
+                if not candidate_indices:
+                    candidate_indices = [station_idx]
+                nn_idx, nn_conf, nn_all = self.select_station_by_nn_or_route(
+                    candidate_indices=candidate_indices,
+                    visited_stations=self.visited_stations_this_leg,
+                    current_pos=self.drone_pos,
+                    current_height=self.drone_height
+                )
+                choices_str = ", ".join(
+                    f"Станция {i + 1}: уверенность {conf:.2f}" for i, conf in nn_all
+                )
+                self.update_log(f"Нейросеть оценила станции: {choices_str}")
+
+                if nn_idx is not None:
+                    found = False
+                    for jump_idx in range(self.current_route_index, len(self.route_points)):
+                        if np.allclose(self.route_points[jump_idx], self.stations[nn_idx], atol=1e-2):
+                            if nn_idx != station_idx:
+                                self.update_log(
+                                    f"❗Нейросеть выбрала станцию {nn_idx + 1} (уверенность {nn_conf:.2f}), маршрут предлагал станцию {station_idx + 1}."
+                                )
+                            else:
+                                self.update_log(
+                                    f"Нейросеть выбрала ту же станцию {nn_idx + 1} (уверенность {nn_conf:.2f}), что и маршрут."
+                                )
+                            self.current_route_index = jump_idx
+                            self.target_pos = self.route_points[self.current_route_index].copy()
+                            found = True
+                            break
+                    if not found:
+                        self.update_log(
+                            f"❗ВНИМАНИЕ: Станция {nn_idx + 1} отсутствует в оставшемся маршруте, продолжаем по плану."
+                        )
+                        self.target_pos = next_point
+                else:
+                    if nn_conf is not None:
+                        self.update_log(
+                            f"Нейросеть не уверена (уверенность {nn_conf:.2f}). Использую станцию по маршруту {station_idx + 1}."
+                        )
+                    else:
+                        self.update_log(
+                            f"Нейросеть не уверена (нет кандидатов). Использую станцию по маршруту {station_idx + 1}."
+                        )
+                    self.target_pos = next_point
+            else:
+                self.target_pos = next_point
 
             self.check_and_handle_feasibility()
             self.mission_active = True
@@ -1892,17 +1991,11 @@ class Simulation:
 
     def select_station_by_nn_or_route(self, candidate_indices, visited_stations, current_pos, current_height):
         """
-        Выбор станции для посадки с помощью нейросети.
-        - candidate_indices: список индексов станций, на которые разрешено садиться согласно маршруту (например, следующая в route_points).
-        - visited_stations: список индексов станций, на которых уже была посадка/зарядка на этом участке (туда/обратно).
-        - current_pos, current_height: позиция и высота дрона.
-        Возвращает индекс выбранной станции (или None, если только маршрутная точка).
+        Возвращает кортеж: (индекс выбранной станции, уверенность, список (индекс, уверенность) по всем кандидатам)
         """
-        # Собираем признаки для всех доступных станций
         X_features = []
         station_idx_map = []
         for i in candidate_indices:
-            # Не предлагать уже посещённые станции
             if i in visited_stations:
                 continue
             x, y = self.stations[i]
@@ -1916,29 +2009,23 @@ class Simulation:
                 self.BATTERY_CAPACITY_WATT_HOURS,
                 current_height,
                 [{'dist': dist, 'status': status, 'height': st_height} for _ in range(2)]
-                # Заполни второй станцией так же, если признаковый формат фиксированный
             )
             X_features.append(feature)
             station_idx_map.append(i)
         if not X_features:
-            # fallback — только стандартный маршрут
-            return None
+            return None, None, []
 
         X_features = np.stack(X_features)
         nn_output = self.nn.forward(X_features)
-        best_idx = np.argmax(nn_output[:, 0])  # [0] если single output per station
+        best_idx = int(np.argmax(nn_output[:, 0]))
+        confidence = float(nn_output[best_idx, 0])
+        confidence_threshold = 0.5
 
-        confidence = nn_output[best_idx, 0]
-        confidence_threshold = 0.5  # можно вынести в параметры
-
-        # Проверка — если уверенность мала, или станция не совпадает с маршрутной, fallback
-        if confidence < confidence_threshold:
-            return None  # Использовать маршрутную
+        all_choices = [(station_idx_map[j], float(nn_output[j, 0])) for j in range(len(station_idx_map))]
         chosen_station_idx = station_idx_map[best_idx]
-        # Если нейросеть выбрала уже посещённую станцию — fallback
-        if chosen_station_idx in visited_stations:
-            return None
-        return chosen_station_idx
+        if confidence < confidence_threshold or chosen_station_idx in visited_stations:
+            return None, confidence, all_choices
+        return chosen_station_idx, confidence, all_choices
 
     def plan_full_mission_with_charging(self, start, end):
         import numpy as np
@@ -2430,9 +2517,7 @@ class Simulation:
     def complete_charge(self):
         """
         Завершение зарядки, обновление графика и подъем на рабочую высоту.
-        После зарядки дрон должен продолжить маршрут строго по route_points, НИКАКИХ вызовов handle_arrival!
-        Гарантируется переход к следующей уникальной точке маршрута (по координате и высоте).
-        Если анимация была остановлена — она будет перезапущена.
+        После зарядки дрон должен продолжить маршрут строго по route_points.
         """
         self.charge = 1.0
         self.remaining_capacity_watt_hours = self.BATTERY_CAPACITY_WATT_HOURS
@@ -2446,7 +2531,6 @@ class Simulation:
         # Подъем на рабочую высоту (строго после зарядки — всегда)
         self.target_height = float(self.entries['drone_height'].get())  # рабочая высота!
         self.is_landing = True
-        # Флаг для предотвращения повторной посадки сразу после зарядки и подъема
         self.just_charged_and_climbed = True
 
         self.update_log(
@@ -2463,12 +2547,10 @@ class Simulation:
             height_change = self.vertical_speed * sim_delta_time
             height_difference = self.target_height - self.drone_height
 
-            # --- Проверяем, достигли ли рабочей высоты ---
             if abs(height_difference) <= abs(height_change):
                 self.drone_height = self.target_height
                 self.is_landing = False
                 self.consume_energy(height_change=height_difference)
-                # ГАРАНТИЯ: после подъема и зарядки — дрон фиксируется на рабочей высоте!
                 self.drone_height = float(self.entries['drone_height'].get())
                 self.target_height = self.drone_height
                 self.update_log(
@@ -2476,46 +2558,9 @@ class Simulation:
                     f"Флаг is_landing={self.is_landing}. Продолжаем маршрут.",
                     level="info"
                 )
-                # --- Пропуск подряд идущих одинаковых точек маршрута по координате и высоте ---
-                if hasattr(self, "route_points") and self.route_points and self.current_route_index is not None:
-                    next_index = self.current_route_index
-                    while next_index + 1 < len(self.route_points):
-                        next_pt = self.route_points[next_index + 1]
-                        # Определяем высоту следующей точки (станция или рабочая высота)
-                        next_height = float(self.entries['drone_height'].get())
-                        for i, st in enumerate(self.stations):
-                            if np.allclose(next_pt, st, atol=1e-2):
-                                next_height = self.station_heights[i]
-                                break
-                        # Пропустить только если совпадает и координата, и высота!
-                        if np.allclose(self.drone_pos, next_pt, atol=1e-2) and abs(
-                                self.drone_height - next_height) < 1e-2:
-                            next_index += 1
-                            continue
-                        else:
-                            break
-                    # Теперь выставляю следующую цель, если есть
-                    if next_index + 1 < len(self.route_points):
-                        self.current_route_index = next_index + 1
-                        self.target_pos = self.route_points[self.current_route_index].copy()
-                        self.update_log(f"После зарядки и подъёма: следующая цель по маршруту: {self.target_pos}")
-                        self.mission_active = True
-                        self.last_charged_station_idx = None  # <--- сбрасываем после подъема
-                        # --- ГАРАНТИЯ запуска анимации, если она была остановлена ---
-                        if not hasattr(self, "animation") or self.animation is None or not getattr(self.animation,
-                                                                                                   "event_source",
-                                                                                                   None) or not getattr(
-                            self.animation.event_source, "_job", None):
-                            self.start_animation()
-                    else:
-                        self.update_log("Все точки маршрута пройдены после зарядки. Миссия завершена.")
-                        self.complete_simulation()
-                else:
-                    self.update_log("Ошибка: нет актуального маршрута после зарядки!")
-                    self.complete_simulation()
+                self.handle_arrival()
                 return
 
-            # --- Если еще не достигли — продолжаем подъем ---
             self.drone_height += height_change if height_difference > 0 else -height_change
             self.consume_energy(height_change=height_change)
             self.update_ui()
@@ -2532,13 +2577,11 @@ class Simulation:
         self.update_log("Продолжаем маршрут после зарядки.")
         self.is_landing = False
 
-        # Проверяю маршрут и индекс
         if not hasattr(self, "route_points") or self.route_points is None or self.current_route_index is None:
             self.update_log("Ошибка: маршрут не задан или индекс не инициализирован при продолжении после зарядки!")
             self.complete_simulation()
             return
 
-        # Проверяю хватит ли заряда до текущей цели (target_pos уже выставлен!)
         end_height = self.drone_height
         for i, station in enumerate(self.stations):
             if np.allclose(self.target_pos, station, atol=1e-2):
@@ -2558,7 +2601,6 @@ class Simulation:
             self.update_log(
                 "Сразу после зарядки: заряда всё ещё недостаточно для продолжения маршрута. Запуск повторной зарядки."
             )
-            # Определяю индекс станции, на которой стоим
             current_station_idx = None
             for i, station in enumerate(self.stations):
                 if np.allclose(self.drone_pos, station, atol=1e-2):
