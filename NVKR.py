@@ -1476,14 +1476,12 @@ class Simulation:
           - Если маршрут окончен — завершает миссию.
         """
 
-        # Если дрон уже заряжается — никаких новых событий
         if self.is_charging:
             return
 
         # Фиксирую позицию дрона на целевой точке (во избежание накопления ошибок)
         self.drone_pos = self.target_pos.copy()
 
-        # Проверяю — текущая цель есть в маршруте?
         if not hasattr(self, "route_points") or self.route_points is None or self.current_route_index is None:
             self.update_log("Ошибка: маршрут не задан или индекс не инициализирован.")
             self.complete_simulation()
@@ -1505,7 +1503,7 @@ class Simulation:
             else:
                 break
 
-        # --- ЛОГИРОВАНИЕ вероятностей нейросети если следующая точка маршрута - док-станция (штраф только если стоим на док-станции и следующая тоже док-станция, но не эта же) ---
+        # --- вычисляем "штрафовать ли" ---
         penalty_coeff = 0.15
         current_station_idx = None
         for i, st in enumerate(self.stations):
@@ -1521,23 +1519,28 @@ class Simulation:
                     next_station_idx = i
                     break
 
+        # Проверяем — не находимся ли мы в начальной или конечной точке маршрута?
+        at_start = np.allclose(self.drone_pos, self.route_points[0], atol=1e-2)
+        at_end = np.allclose(self.drone_pos, self.route_points[-1], atol=1e-2)
+
+        # --- логика применения штрафа ---
         X = self.generate_drone_params().reshape(1, -1)
         neural_output = self.nn.forward(X)[0]
         raw_output = neural_output.copy()
         corrected_output = neural_output.copy()
-
-        # Применяем мягкий штраф только если стоим на док-станции и следующая точка — другая док-станция
         penalty_applied = False
+
+        # Штраф только если МЫ стоим на док-станции (и это не старт/финиш) и следующая точка — другая док-станция
         if (
-                current_station_idx is not None
-                and next_station_idx is not None
-                and current_station_idx != next_station_idx
+                current_station_idx is not None and
+                not at_start and not at_end and
+                next_station_idx is not None and
+                current_station_idx != next_station_idx
         ):
-            for i in range(len(corrected_output)):
-                if i == current_station_idx:
-                    corrected_output[i] *= penalty_coeff
+            corrected_output[current_station_idx] *= penalty_coeff
             penalty_applied = True
 
+        # Логируем вероятности всегда
         if next_station_idx is not None:
             msg = (
                 f"🧠 Вероятности выбора док-станций нейросетью (исходные):\n"
@@ -1576,7 +1579,7 @@ class Simulation:
                     self.visited_stations = set()
                 self.last_station_index = i
 
-                # --- СТАРАЯ ЛОГИКА ПОСАДКИ/ЗАРЯДКИ ---
+                # --- ЛОГИКА ПОСАДКИ/ЗАРЯДКИ ---
                 if abs(self.drone_height - self.station_heights[i]) > 1e-2:
                     self.is_landing = True
                     self.target_height = self.station_heights[i]
