@@ -1503,39 +1503,55 @@ class Simulation:
             else:
                 break
 
-        # --- вычисляем "штрафовать ли" ---
-        penalty_coeff = 0.15
+        # --- Новый способ определения текущей и следующей точки маршрута ---
+        current_point = self.route_points[self.current_route_index] if self.current_route_index < len(
+            self.route_points) else None
+        next_point = self.route_points[self.current_route_index + 1] if (self.current_route_index + 1) < len(
+            self.route_points) else None
+
+        # Является ли текущая точка маршрута док-станцией?
         current_station_idx = None
         for i, st in enumerate(self.stations):
-            if np.allclose(self.drone_pos, st, atol=1e-2):
+            if current_point is not None and np.allclose(current_point, st, atol=1e-2):
                 current_station_idx = i
                 break
 
+        # Является ли следующая точка маршрута док-станцией?
         next_station_idx = None
-        if self.current_route_index + 1 < len(self.route_points):
-            next_point = self.route_points[self.current_route_index + 1]
-            for i, st in enumerate(self.stations):
-                if np.allclose(next_point, st, atol=1e-2):
-                    next_station_idx = i
-                    break
+        for i, st in enumerate(self.stations):
+            if next_point is not None and np.allclose(next_point, st, atol=1e-2):
+                next_station_idx = i
+                break
 
-        # Проверяем — не находимся ли мы в начальной или конечной точке маршрута?
-        at_start = np.allclose(self.drone_pos, self.route_points[0], atol=1e-2)
-        at_end = np.allclose(self.drone_pos, self.route_points[-1], atol=1e-2)
+        # Новый способ: определяем старт/финиш ЧЕРЕЗ ИНДЕКС
+        at_start = (self.current_route_index == 0)
+        at_end = (self.current_route_index == len(self.route_points) - 1)
 
         # --- логика применения штрафа ---
+        penalty_coeff = 0.15
         X = self.generate_drone_params().reshape(1, -1)
         neural_output = self.nn.forward(X)[0]
         raw_output = neural_output.copy()
         corrected_output = neural_output.copy()
         penalty_applied = False
 
-        # Штраф только если МЫ стоим на док-станции (и это не старт/финиш) и следующая точка — другая док-станция
+        # DEBUG-лог для полного контекста
+        self.update_log(
+            f"[DEBUG] at_start={at_start}, at_end={at_end}, just_charged={getattr(self, 'just_charged_and_climbed', False)}, "
+            f"current_station_idx={current_station_idx}, next_station_idx={next_station_idx}, current_point={current_point}, next_point={next_point}"
+        )
+
+        # Применяем штраф ТОЛЬКО если:
+        # - текущая точка маршрута — док-станция
+        # - следующая точка — док-станция и другая
+        # - не на старте/финише (определяется по индексу!)
+        # - не только что взлетели после зарядки
         if (
                 current_station_idx is not None and
-                not at_start and not at_end and
                 next_station_idx is not None and
-                current_station_idx != next_station_idx
+                current_station_idx != next_station_idx and
+                not at_start and not at_end and
+                not getattr(self, "just_charged_and_climbed", False)
         ):
             corrected_output[current_station_idx] *= penalty_coeff
             penalty_applied = True
